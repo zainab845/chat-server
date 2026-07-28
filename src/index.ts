@@ -14,12 +14,15 @@ dotenv.config();
 const app = express();
 const server = http.createServer(app);
 
-const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:3000';
+// Parse single or comma-separated client URLs into an array
+const allowedOrigins = (process.env.CLIENT_URL || 'http://localhost:3000')
+  .split(',')
+  .map(url => url.trim().replace(/\/$/, '')); // removes any trailing slashes automatically
 
-// Socket.io with CORS for Next.js origin
+// Socket.io with CORS for allowed origins
 const io = new Server(server, {
   cors: {
-    origin: CLIENT_URL,
+    origin: allowedOrigins,
     methods: ['GET', 'POST'],
     credentials: true,
   },
@@ -27,7 +30,13 @@ const io = new Server(server, {
   pingInterval: 25000,
 });
 
-app.use(cors({ origin: CLIENT_URL, credentials: true }));
+// Express CORS middleware
+app.use(
+  cors({
+    origin: allowedOrigins,
+    credentials: true,
+  })
+);
 app.use(express.json());
 
 // ── REST endpoints (for initial data loads without sockets) ─────────
@@ -71,7 +80,7 @@ mongoose
     const PORT = process.env.PORT || 3001;
     server.listen(PORT, () => {
       console.log(`Chat server running on port ${PORT}`);
-      console.log(`Accepting connections from: ${CLIENT_URL}`);
+      console.log(`Accepting connections from: ${allowedOrigins.join(', ')}`);
     });
   })
   .catch(err => {
