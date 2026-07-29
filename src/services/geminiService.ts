@@ -143,7 +143,7 @@ INSTRUCTIONS:
 6. Do not make up product names, prices, or policies not mentioned above
 7. Do not discuss competitors or make promises the store has not made`;
 
-const model = genAI.getGenerativeModel({ model: 'gemini-pro' });
+const model = genAI.getGenerativeModel({ model: 'gemini-3.6-flash' });
 
     const result = await model.generateContent([
       { text: systemPrompt },
