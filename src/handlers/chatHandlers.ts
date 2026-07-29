@@ -2,12 +2,115 @@ import { Server } from 'socket.io';
 import { AuthSocket } from '../middleware/socketAuth';
 import Conversation from '../models/Conversation';
 import Message from '../models/Message';
+import { generateAIResponse } from '../services/geminiService';
 
 const adminSockets = new Set<string>();
+const adminActiveConversation = new Map<string, string>();
 
-// Track which conversation each admin has open right now
-// so we can auto-mark messages as read in real time
-const adminActiveConversation = new Map<string, string>(); // socketId → conversationId
+// Timer tracking — one timer per conversation
+// Cancelled when admin replies, fires Gemini after 30 seconds
+const aiResponseTimers = new Map<string, NodeJS.Timeout>();
+
+async function triggerAIResponse(
+  io: Server,
+  conversationId: string,
+  userMessage: string,
+  userName: string,
+  userId: string
+) {
+  try {
+    const aiText = await generateAIResponse(conversationId, userMessage, userName);
+
+    if (!aiText) {
+      console.log(`[AI] No response generated for conversation ${conversationId}`);
+      return;
+    }
+
+    // Double-check that no admin has replied since the timer started
+    const lastMessage = await Message.findOne({ conversationId })
+      .sort({ createdAt: -1 })
+      .lean();
+
+    if (lastMessage && lastMessage.senderRole === 'admin') {
+      console.log('[AI] Admin already replied — skipping AI response');
+      return;
+    }
+
+    // Save AI message to database
+    const aiMessage = await Message.create({
+      conversationId,
+      senderId: 'ai-assistant',
+      senderName: 'AI Assistant',
+      senderRole: 'ai',
+      content: aiText,
+      read: false,
+    });
+
+    await Conversation.findByIdAndUpdate(conversationId, {
+      lastMessage: aiText,
+      lastMessageAt: new Date(),
+      $inc: { unreadByUser: 1 },
+    });
+
+    const messagePayload = {
+      _id: aiMessage._id.toString(),
+      conversationId,
+      senderId: 'ai-assistant',
+      senderName: 'AI Assistant',
+      senderRole: 'ai' as const,
+      content: aiText,
+      read: false,
+      createdAt: aiMessage.createdAt,
+    };
+
+    // Send to the conversation room (user sees it in real time)
+    io.to(`conversation:${conversationId}`).emit('new_message', messagePayload);
+
+    // Update admin sidebar with the AI's last message
+    io.to('admin-room').emit('conversation_updated', {
+      conversationId,
+      lastMessage: aiText,
+      lastMessageAt: new Date(),
+      unreadByAdmin: 0,
+    });
+
+    console.log(`[AI] Responded to ${userName} in conversation ${conversationId}`);
+  } catch (error) {
+    console.error('[AI] Error generating response:', error);
+  } finally {
+    aiResponseTimers.delete(conversationId);
+  }
+}
+
+function scheduleAIResponse(
+  io: Server,
+  conversationId: string,
+  userMessage: string,
+  userName: string,
+  userId: string
+) {
+  // Cancel any existing timer for this conversation
+  cancelAITimer(conversationId);
+
+  const DELAY_SECONDS = 30;
+
+  const timer = setTimeout(
+    () => triggerAIResponse(io, conversationId, userMessage, userName, userId),
+    DELAY_SECONDS * 1000
+  );
+
+  aiResponseTimers.set(conversationId, timer);
+  console.log(`[AI] Timer set — will respond to ${userName} in ${DELAY_SECONDS}s if admin doesn't reply`);
+}
+
+function cancelAITimer(conversationId: string) {
+  const existing = aiResponseTimers.get(conversationId);
+  if (existing) {
+    clearTimeout(existing);
+    aiResponseTimers.delete(conversationId);
+    console.log(`[AI] Timer cancelled for conversation ${conversationId} — admin replied`);
+  }
+}
 
 export function registerChatHandlers(io: Server, socket: AuthSocket) {
   const userId = socket.userId!;
@@ -20,7 +123,6 @@ export function registerChatHandlers(io: Server, socket: AuthSocket) {
     adminSockets.add(socket.id);
     socket.join('admin-room');
 
-    // Join all open conversation rooms
     Conversation.find({ status: 'open' })
       .select('_id')
       .lean()
@@ -53,9 +155,7 @@ export function registerChatHandlers(io: Server, socket: AuthSocket) {
       }
     });
 
-    socket.on('disconnect', () => {
-      // nothing extra needed
-    });
+    socket.on('disconnect', () => {});
   }
 
   // ── Send message ──────────────────────────────────────────────────
@@ -70,8 +170,6 @@ export function registerChatHandlers(io: Server, socket: AuthSocket) {
         return;
       }
 
-      // Check if any admin has THIS conversation open right now
-      // If yes, mark the message as immediately read
       const isAdminReadingThisConversation = [...adminActiveConversation.entries()].some(
         ([, convId]) => convId === conversationId
       );
@@ -82,7 +180,6 @@ export function registerChatHandlers(io: Server, socket: AuthSocket) {
         senderName: userName,
         senderRole: userRole === 'admin' ? 'admin' : 'user',
         content: content.trim(),
-        // Auto-mark as read if admin has the conversation open
         read: userRole === 'user' ? isAdminReadingThisConversation : false,
       });
 
@@ -90,11 +187,13 @@ export function registerChatHandlers(io: Server, socket: AuthSocket) {
         await Conversation.findByIdAndUpdate(conversationId, {
           lastMessage: content.trim(),
           lastMessageAt: new Date(),
-          // Don't increment unread if admin is already reading
           $inc: { unreadByAdmin: isAdminReadingThisConversation ? 0 : 1 },
           userTyping: false,
         });
       } else {
+        // Admin replied — cancel the AI timer immediately
+        cancelAITimer(conversationId);
+
         await Conversation.findByIdAndUpdate(conversationId, {
           lastMessage: content.trim(),
           lastMessageAt: new Date(),
@@ -114,11 +213,9 @@ export function registerChatHandlers(io: Server, socket: AuthSocket) {
         createdAt: message.createdAt,
       };
 
-      // Broadcast to conversation room
       io.to(`conversation:${conversationId}`).emit('new_message', messagePayload);
 
       if (userRole === 'user') {
-        // Notify admin sidebar
         const updatedConv = await Conversation.findById(conversationId).lean();
         io.to('admin-room').emit('conversation_updated', {
           conversationId,
@@ -127,21 +224,27 @@ export function registerChatHandlers(io: Server, socket: AuthSocket) {
           unreadByAdmin: updatedConv?.unreadByAdmin ?? 0,
         });
 
-        // If admin already has this conversation open, send immediate read receipt
         if (isAdminReadingThisConversation) {
-          // Tell the user their message was instantly read
           io.to(`user:${userId}`).emit('messages_read', {
             conversationId,
             readBy: 'admin',
           });
         }
 
-        // Make sure all admin sockets are in this conversation room
         for (const adminSocketId of adminSockets) {
           const adminSocket = io.sockets.sockets.get(adminSocketId);
           if (adminSocket) {
             adminSocket.join(`conversation:${conversationId}`);
           }
+        }
+
+        // ── Schedule AI response if admin is not actively in this conversation ─
+        // Only trigger if no admin has this conversation open right now
+        if (!isAdminReadingThisConversation) {
+          scheduleAIResponse(io, conversationId, content.trim(), userName, userId);
+        } else {
+          // Admin is reading live — no AI needed
+          console.log(`[AI] Admin is active in conversation — no AI timer needed`);
         }
       }
     } catch (error) {
@@ -156,13 +259,13 @@ export function registerChatHandlers(io: Server, socket: AuthSocket) {
 
     const { conversationId } = data;
 
-    // Track which conversation this admin has open
-    adminActiveConversation.set(socket.id, conversationId);
+    // Admin opened the chat — cancel any pending AI timer
+    cancelAITimer(conversationId);
 
+    adminActiveConversation.set(socket.id, conversationId);
     socket.join(`conversation:${conversationId}`);
 
     try {
-      // Mark all unread user messages as read
       await Message.updateMany(
         { conversationId, senderRole: 'user', read: false },
         { read: true }
@@ -172,7 +275,6 @@ export function registerChatHandlers(io: Server, socket: AuthSocket) {
         unreadByAdmin: 0,
       });
 
-      // Fetch last 50 messages
       const messages = await Message.find({ conversationId })
         .sort({ createdAt: -1 })
         .limit(50)
@@ -187,20 +289,16 @@ export function registerChatHandlers(io: Server, socket: AuthSocket) {
         })),
       });
 
-      // ── THIS IS THE KEY FIX ──────────────────────────────────────
-      // Find who owns this conversation and send them a read receipt
       const conversation = await Conversation.findById(conversationId)
         .select('userId')
         .lean();
 
       if (conversation?.userId) {
-        // Emit to the conversation room (catches user if they're there)
         io.to(`conversation:${conversationId}`).emit('messages_read', {
           conversationId,
           readBy: 'admin',
         });
 
-        // Also emit directly to user's personal room as a guaranteed fallback
         io.to(`user:${conversation.userId}`).emit('messages_read', {
           conversationId,
           readBy: 'admin',
@@ -211,7 +309,6 @@ export function registerChatHandlers(io: Server, socket: AuthSocket) {
     }
   });
 
-  // Admin closes/changes conversation — stop tracking it as active
   socket.on('admin_close_active', () => {
     if (userRole !== 'admin') return;
     adminActiveConversation.delete(socket.id);
@@ -236,7 +333,6 @@ export function registerChatHandlers(io: Server, socket: AuthSocket) {
         })),
       });
 
-      // Mark admin messages as read by user
       await Message.updateMany(
         { conversationId, senderRole: { $in: ['admin', 'ai'] }, read: false },
         { read: true }
@@ -254,10 +350,12 @@ export function registerChatHandlers(io: Server, socket: AuthSocket) {
   socket.on('typing_start', async (data: { conversationId: string }) => {
     const { conversationId } = data;
 
-    if (userRole === 'user') {
-      await Conversation.findByIdAndUpdate(conversationId, { userTyping: true });
-    } else {
+    // If admin starts typing, cancel the AI timer
+    if (userRole === 'admin') {
+      cancelAITimer(conversationId);
       await Conversation.findByIdAndUpdate(conversationId, { adminTyping: true });
+    } else {
+      await Conversation.findByIdAndUpdate(conversationId, { userTyping: true });
     }
 
     socket.to(`conversation:${conversationId}`).emit('typing_update', {
@@ -283,7 +381,7 @@ export function registerChatHandlers(io: Server, socket: AuthSocket) {
     });
   });
 
-  // ── Get all conversations (admin) ─────────────────────────────────
+  // ── Get all conversations ─────────────────────────────────────────
   socket.on('get_conversations', async () => {
     if (userRole !== 'admin') return;
 
@@ -302,8 +400,10 @@ export function registerChatHandlers(io: Server, socket: AuthSocket) {
   socket.on('close_conversation', async (data: { conversationId: string }) => {
     if (userRole !== 'admin') return;
 
-    await Conversation.findByIdAndUpdate(data.conversationId, { status: 'closed' });
+    cancelAITimer(data.conversationId);
     adminActiveConversation.delete(socket.id);
+
+    await Conversation.findByIdAndUpdate(data.conversationId, { status: 'closed' });
 
     io.to(`conversation:${data.conversationId}`).emit('conversation_closed', {
       conversationId: data.conversationId,
@@ -316,13 +416,11 @@ export function registerChatHandlers(io: Server, socket: AuthSocket) {
 
     try {
       await Conversation.findByIdAndUpdate(data.conversationId, { status: 'open' });
-      
-      // Notify the admin sidebar so it removes the "Closed" badge
+
       io.to('admin-room').emit('conversation_reopened', {
         conversationId: data.conversationId,
       });
 
-      // Notify the conversation room so the chat unlocks for the user
       io.to(`conversation:${data.conversationId}`).emit('conversation_reopened', {
         conversationId: data.conversationId,
       });
