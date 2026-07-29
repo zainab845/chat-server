@@ -309,4 +309,25 @@ export function registerChatHandlers(io: Server, socket: AuthSocket) {
       conversationId: data.conversationId,
     });
   });
+
+  // ── Reopen conversation ───────────────────────────────────────────
+  socket.on('reopen_conversation', async (data: { conversationId: string }) => {
+    if (userRole !== 'admin') return;
+
+    try {
+      await Conversation.findByIdAndUpdate(data.conversationId, { status: 'open' });
+      
+      // Notify the admin sidebar so it removes the "Closed" badge
+      io.to('admin-room').emit('conversation_reopened', {
+        conversationId: data.conversationId,
+      });
+
+      // Notify the conversation room so the chat unlocks for the user
+      io.to(`conversation:${data.conversationId}`).emit('conversation_reopened', {
+        conversationId: data.conversationId,
+      });
+    } catch (error) {
+      console.error('reopen_conversation error:', error);
+    }
+  });
 }
