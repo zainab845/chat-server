@@ -145,7 +145,7 @@ export function registerChatHandlers(io: Server, socket: AuthSocket) {
     Conversation.findOneAndUpdate(
       { userId },
       { $setOnInsert: { userId, userName, userEmail } },
-      { upsert: true, new: true }
+      { upsert: true, returnDocument: 'after' } 
     ).then(conversation => {
       if (conversation) {
         socket.join(`conversation:${conversation._id}`);
